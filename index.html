@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+<title>Minecraft-lite Web — Play</title>
+<style>
+  html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#06121a;color:#d6eef0}
+  #ui {position:fixed;left:12px;top:12px;z-index:30}
+  #hint{background:rgba(0,0,0,0.35);padding:8px 10px;border-radius:8px;font-size:13px}
+  #inventory{position:fixed;right:12px;bottom:12px;z-index:30;display:flex;gap:8px}
+  .slot{background:rgba(0,0,0,0.35);padding:8px 10px;border-radius:8px;min-width:44px;text-align:center;cursor:pointer}
+  .slot.active{outline:2px solid #7fffd4}
+  #mobile-controls{position:fixed;left:12px;bottom:12px;z-index:25;display:flex;align-items:center;gap:12px}
+  #joyBase{width:110px;height:110px;border-radius:50%;background:rgba(255,255,255,0.04);position:relative;touch-action:none}
+  #joyKnob{width:48px;height:48px;border-radius:50%;background:linear-gradient(#6ff5e8,#2dd4bf);position:absolute;left:31px;top:31px;touch-action:none}
+  #lookLayer{position:fixed;right:0;top:0;bottom:0;left:40%;z-index:24;touch-action:none} /* area to drag-look on mobile */
+  canvas{display:block;width:100%;height:100vh}
+  #loading{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#052428;padding:14px;border-radius:10px}
+  .btn{background:rgba(255,255,255,0.06);padding:8px 10px;border-radius:8px;cursor:pointer}
+</style>
+</head>
+<body>
+  <div id="loading">Loading... (Three.js)</div>
+  <div id="ui">
+    <div id="hint">Klik/ketuk untuk fokus. Desktop: klik canvas. Gerak: WASD / joystick. LeftClick/ Tap kiri = break, RightClick / Tap kanan = place, R = ganti blok</div>
+  </div>
+
+  <div id="inventory"></div>
+
+  <div id="mobile-controls" style="display:none">
+    <div id="joyBase"><div id="joyKnob"></div></div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <div class="btn" id="btnBreak">BREAK</div>
+      <div class="btn" id="btnPlace">PLACE</div>
+    </div>
+  </div>
+
+  <div id="lookLayer"></div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.156.0/build/three.module.js';
+import { PointerLockControls } from 'https://unpkg.com/three@0.156.0/examples/jsm/controls/PointerLockControls.js';
+/*
+  Minecraft-lite Web (single-file)
+  - Simple voxel world using InstancedMesh
+  - Click to break, right-click to place
+  - Mobile joystick + drag to look
+  - Designed to be reasonably light for mobile
+*/
+
+// ---------- Settings ----------
+const CHUNK_W = 32; // chunk width in blocks
+const CHUNK_H = 10; // height
+const BLOCK_SIZE = 1;
+const WORLD_SEED = 12345; // deterministic-ish
+const TYPES = [
+  {id:0,name:'Air', color: null},
+  {id:1,name:'Dirt', color: '#6b482f'},
+  {id:2,name:'Grass', color: '#3aa34b'},
+  {id:3,name:'Stone', color: '#8a8f99'},
+  {id:4,name:'Sand', color: '#e6d29a'},
+  {id:5,name:'Wood', color: '#7b4f2a'}
+];
+
+// ---------- Basic world data (simple heightmap) ----------
+function seededRandom(seed) {
+  let s = seed % 2147483647;
+  if (s <= 0) s += 2147483646;
+  return function() { s = s * 16807 % 2147483647; return (s - 1) / 2147483646; }
+}
+const rnd = seededRandom(WORLD_SEED);
+
+// create simple heightmap
+const world = { w: CHUNK_W, h: CHUNK_H, d: CHUNK_W };
+const blocks = new Uint8Array(world.w * world.h * world.d); // store type id
+
+function idx(x,y,z){ return (y * world.d + z) * world.w + x; }
+
+// populate
+for(let x=0;x<world.w;x++){
+  for(let z=0;z<world.d;z++){
+    // height using sin + noise
+    const base = 3 + Math.floor(3 * Math.sin(x*0.3) + 2 * (rnd()*0.9));
+    for(let y=0;y<world.h;y++){
+      let t = 0; // air
+      if(y <= base - 1) t = 3; // stone/sand
+      if(y === base) t = 2; // grass top
+      if(y < base && y > base - 3) t = 1; // dirt
+      if(y < 1) t = 4; // sand near bottom
+      if(y === base + 1 && rnd() > 0.96) t = 5; // occasional wood block (tree trunk)
+      blocks[idx(x,y,z)] = t;
+    }
+  }
+}
+
+// ---------- Three.js scene ----------
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x071921, 0.011);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.3, 2000);
+camera.position.set( world.w/2, world.h + 2, world.d/2 );
+camera.rotation.order = 'YXZ';
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// lighting
+const hemi = new THREE.HemisphereLight(0xddeeff, 0x0d2126, 0.9);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+dir.position.set(5,10,2);
+scene.add(dir);
+
+// ground ambient
+const ambient = new THREE.AmbientLight(0x7aa6a0, 0.2);
+scene.add(ambient);
+
+// ---------- Voxel rendering via InstancedMesh ----------
+const BOX_G = new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+const MAX_INST = world.w * world.h * world.d;
+const materials = {};
+for(const t of TYPES){
+  if(t.color){
+    materials[t.id] = new THREE.MeshStandardMaterial({ color: new THREE.Color(t.color) });
+  } else {
+    materials[t.id] = null;
+  }
+}
+const instanced = {}; // per-type InstancedMesh
+for(const t of TYPES){
+  if(t.id===0) continue;
+  const mat = materials[t.id];
+  const mesh = new THREE.InstancedMesh(BOX_G, mat, MAX_INST);
+  mesh.count = 0;
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  scene.add(mesh);
+  instanced[t.id] = mesh;
+}
+
+// build instance matrices from blocks
+function rebuildInstances(){
+  // reset counts
+  for(const k in instanced){ instanced[k].count = 0; }
+  const temp = new THREE.Object3D();
+  let counters = {}; for(const t of TYPES) counters[t.id]=0;
+  for(let x=0;x<world.w;x++){
+    for(let y=0;y<world.h;y++){
+      for(let z=0;z<world.d;z++){
+        const t = blocks[idx(x,y,z)];
+        if(t === 0) continue;
+        temp.position.set(x+0.5, y+0.5, z+0.5);
+        temp.updateMatrix();
+        const mesh = instanced[t];
+        const id = counters[t]++;
+        mesh.setMatrixAt(id, temp.matrix);
+        mesh.count = id + 1;
+      }
+    }
+  }
+  // mark instance matrices needsUpdate
+  for(const k in instanced){
+    instanced[k].instanceMatrix.needsUpdate = true;
+  }
+}
+rebuildInstances();
+
+// ---------- Player & controls ----------
+const controls = new PointerLockControls(camera, document.body);
+let velocity = new THREE.Vector3();
+let direction = new THREE.Vector3();
+let move = { fwd:false, back:false, left:false, right:false };
+let canJump = false;
+
+// pointer lock handling
+renderer.domElement.addEventListener('click', ()=> {
+  // on mobile we may not want pointer lock; detect mobile
+  if(/Mobi|Android/i.test(navigator.userAgent)) return;
+  controls.lock();
+});
+controls.addEventListener('lock', ()=>{ document.getElementById('loading').style.display='none'; });
+controls.addEventListener('unlock', ()=>{ /* noop */ });
+
+// basic raycaster for block interactions
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+// keyboard
+window.addEventListener('keydown',(e)=>{
+  if(e.code === 'KeyW') move.fwd = true;
+  if(e.code === 'KeyS') move.back = true;
+  if(e.code === 'KeyA') move.left = true;
+  if(e.code === 'KeyD') move.right = true;
+  if(e.code === 'Space' && canJump){ velocity.y += 6; canJump=false; }
+  if(e.key === 'r' || e.key === 'R'){ // switch block
+    selected = (selected + 1) % TYPES.length;
+    updateInventory();
+  }
+});
+
+window.addEventListener('keyup',(e)=>{
+  if(e.code === 'KeyW') move.fwd = false;
+  if(e.code === 'KeyS') move.back = false;
+  if(e.code === 'KeyA') move.left = false;
+  if(e.code === 'KeyD') move.right = false;
+});
+
+// mouse actions
+renderer.domElement.addEventListener('pointerdown', (ev) => {
+  if(ev.button === 0) doBreak(); // left
+  if(ev.button === 2) doPlace(); // right
+});
+renderer.domElement.addEventListener('contextmenu', (e)=> e.preventDefault());
+
+// simple player position & collision: we will clamp to world bounds and above ground
+let playerPos = new THREE.Vector3(world.w/2 + 0.5, world.h + 1.6, world.d/2 + 0.5);
+
+// gravity
+const GRAVITY = -20;
+
+// --- block interaction helpers ---
+function worldCoordinateFromRay(){
+  // shoot ray from camera and find the nearest solid block intersected;
+  // returns {hitPos, blockPos, normal, type} or null
+  const cam = camera;
+  const origin = cam.getWorldPosition(new THREE.Vector3());
+  const dirv = new THREE.Vector3();
+  cam.getWorldDirection(dirv);
+  raycaster.set(origin, dirv);
+  // brute force: step along ray and test block occupancy up to distance 8
+  const maxD = 8;
+  const step = 0.2;
+  for(let d=0; d<maxD; d+=step){
+    const p = origin.clone().addScaledVector(dirv, d);
+    const bx = Math.floor(p.x);
+    const by = Math.floor(p.y);
+    const bz = Math.floor(p.z);
+    if(bx >=0 && bx < world.w && by >=0 && by < world.h && bz >=0 && bz < world.d){
+      const t = blocks[idx(bx,by,bz)];
+      if(t !== 0){
+        // compute face normal by checking which axis is nearest fractional
+        const local = new THREE.Vector3(p.x - bx - 0.5, p.y - by - 0.5, p.z - bz - 0.5);
+        const ax = Math.abs(local.x), ay=Math.abs(local.y), az=Math.abs(local.z);
+        let normal = new THREE.Vector3();
+        if(ax > ay && ax > az) normal.x = local.x > 0 ? 1 : -1;
+        else if(ay > ax && ay > az) normal.y = local.y > 0 ? 1 : -1;
+        else normal.z = local.z > 0 ? 1 : -1;
+        return {hitPoint: p, blockPos: new THREE.Vector3(bx,by,bz), normal, type:t};
+      }
+    }
+  }
+  return null;
+}
+
+function doBreak(){
+  const res = worldCoordinateFromRay();
+  if(!res) return;
+  const b = res.blockPos;
+  blocks[idx(b.x,b.y,b.z)] = 0;
+  rebuildInstances();
+}
+function doPlace(){
+  const res = worldCoordinateFromRay();
+  if(!res) return;
+  const p = res.blockPos;
+  const n = res.normal;
+  const tx = p.x + n.x;
+  const ty = p.y + n.y;
+  const tz = p.z + n.z;
+  if(tx>=0 && tx < world.w && ty>=0 && ty < world.h && tz>=0 && tz < world.d){
+    // place selected block (skip if placing inside player)
+    const t = selected;
+    // don't place Air
+    if(t===0) return;
+    blocks[idx(tx,ty,tz)] = t;
+    rebuildInstances();
+  }
+}
+
+// ---------- Mobile controls (joystick & drag to look) ----------
+const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+const mobileControls = document.getElementById('mobile-controls');
+const joyBase = document.getElementById('joyBase');
+const joyKnob = document.getElementById('joyKnob');
+const lookLayer = document.getElementById('lookLayer');
+const btnBreak = document.getElementById('btnBreak');
+const btnPlace = document.getElementById('btnPlace');
+
+if(isMobile){
+  mobileControls.style.display = 'flex';
+  document.getElementById('loading').style.display = 'none';
+}
+
+// joystick state
+let joyActive = false, joyCenter = {x:0,y:0}, joyMax = 36;
+function layoutJoy(){ const r = joyBase.getBoundingClientRect(); joyCenter.x = r.left + r.width/2; joyCenter.y = r.top + r.height/2; joyMax = r.width/2 - 12; }
+layoutJoy();
+window.addEventListener('resize', () => setTimeout(layoutJoy,100));
+
+// joystick touch
+joyBase.addEventListener('touchstart',(e)=>{ e.preventDefault(); joyActive = true; layoutJoy(); handleJoyMove(e.touches[0]); }, {passive:false});
+joyBase.addEventListener('touchmove',(e)=>{ e.preventDefault(); handleJoyMove(e.touches[0]); }, {passive:false});
+joyBase.addEventListener('touchend',(e)=>{ joyActive = false; joyKnob.style.transform='translate(0px,0px)'; move.fwd=move.back=move.left=move.right=false; }, {passive:false});
+
+function handleJoyMove(t){
+  const dx = t.clientX - joyCenter.x;
+  const dy = t.clientY - joyCenter.y;
+  const dist = Math.hypot(dx,dy);
+  const nx = dx / Math.max(1,dist);
+  const ny = dy / Math.max(1,dist);
+  const mag = Math.min(dist, joyMax) / joyMax;
+  // map to WASD-like controls
+  move.fwd = ny < -0.35;
+  move.back = ny > 0.35;
+  move.left = nx < -0.35;
+  move.right = nx > 0.35;
+  joyKnob.style.transform = `translate(${Math.max(-joyMax,Math.min(joyMax,dx))}px, ${Math.max(-joyMax,Math.min(joyMax,dy))}px)`;
+}
+
+// mobile look: drag on right half to control camera rotation
+let lookDown=false, lastTouch={x:0,y:0};
+lookLayer.addEventListener('touchstart', (e)=>{ lookDown=true; lastTouch.x=e.touches[0].clientX; lastTouch.y=e.touches[0].clientY; }, {passive:false});
+lookLayer.addEventListener('touchmove', (e)=>{ if(!lookDown) return; const nx=e.touches[0].clientX, ny=e.touches[0].clientY; const dx=(nx-lastTouch.x)/200, dy=(ny-lastTouch.y)/200; controls.getObject().rotation.y -= dx; camera.rotation.x -= dy; camera.rotation.x = Math.max(-Math.PI/2, Math.min(Math.PI/2, camera.rotation.x)); lastTouch.x=nx; lastTouch.y=ny; }, {passive:false});
+lookLayer.addEventListener('touchend', ()=>{ lookDown=false; }, {passive:false});
+
+if(isMobile){
+  btnBreak.addEventListener('click', ()=> doBreak());
+  btnPlace.addEventListener('click', ()=> doPlace());
+}
+
+// ---------- Inventory UI ----------
+const invEl = document.getElementById('inventory');
+let selected = 1;
+function updateInventory(){
+  invEl.innerHTML = '';
+  for(const t of TYPES){
+    if(t.id === 0) continue;
+    const div = document.createElement('div');
+    div.className = 'slot' + (t.id===selected? ' active':'');
+    div.textContent = t.name;
+    div.title = t.name;
+    div.addEventListener('click', ()=> { selected = t.id; updateInventory(); });
+    invEl.appendChild(div);
+  }
+}
+updateInventory();
+
+// ---------- Main loop ----------
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(0.05, clock.getDelta());
+
+  // movement
+  const speed = 4.2;
+  direction.set(0,0,0);
+  if(move.fwd) direction.z -= 1;
+  if(move.back) direction.z += 1;
+  if(move.left) direction.x -= 1;
+  if(move.right) direction.x += 1;
+  if(direction.lengthSq() > 0){
+    direction.normalize();
+    // transform by camera yaw (only yaw)
+    const yaw = controls.getObject().rotation.y;
+    const sin = Math.sin(yaw), cos = Math.cos(yaw);
+    const vx = direction.x * cos + direction.z * -sin;
+    const vz = direction.x * sin + direction.z * cos;
+    playerPos.x += vx * speed * dt;
+    playerPos.z += vz * speed * dt;
+  }
+
+  // gravity & simple ground collision: determine ground height at player's x,z
+  const px = Math.floor(playerPos.x);
+  const pz = Math.floor(playerPos.z);
+  let groundY = 0;
+  if(px>=0 && px<world.w && pz>=0 && pz<world.d){
+    // find highest solid block at x,z
+    for(let y=world.h-1;y>=0;y--){
+      if(blocks[idx(px,y,pz)] !== 0){ groundY = y+1; break; }
+    }
+  }
+  // apply gravity to y
+  if(playerPos.y > groundY + 1.6) {
+    velocity.y += GRAVITY * dt;
+    playerPos.y += velocity.y * dt;
+  } else {
+    playerPos.y = groundY + 1.6;
+    velocity.y = 0;
+    canJump = true;
+  }
+
+  // clamp inside world bounds
+  playerPos.x = Math.max(1, Math.min(world.w-1, playerPos.x));
+  playerPos.z = Math.max(1, Math.min(world.d-1, playerPos.z));
+
+  // update camera position to follow player
+  controls.getObject().position.set(playerPos.x, playerPos.y, playerPos.z);
+  // if pointerlock not used on mobile, keep camera rotation updated from touch drag (we already modify camera.rotation)
+  camera.updateMatrixWorld();
+
+  renderer.render(scene, camera);
+}
+animate();
+
+// hide loading text
+document.getElementById('loading').style.display = 'none';
+
+// handle window resize
+window.addEventListener('resize', ()=> {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+</script>
+</body>
+</html>
